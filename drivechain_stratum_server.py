@@ -3,7 +3,7 @@
 
 Minimal Stratum server skeleton for Drivechain / BMM experimentation **on Litecoin**.
 
-Target: cgminer/bfgminer + USB miner, on a local Litecoin node
+Target: Antminer L3 or other Stratum V1 miner, on a local Litecoin node
 (patched for BIP301 / Drivechain) and a single Drivechain sidechain
 (Thunder / cusf_sidechain / etc.).
 
@@ -123,7 +123,7 @@ MINER_PKH_HEX = os.getenv("MINER_PKH_HEX", "")
 # ----------------------------
 
 def sha256d(b: bytes) -> bytes:
-    """Double SHA256."""
+    """Double SHA256 (used here only for logging / debugging, not PoW)."""
     return hashlib.sha256(hashlib.sha256(b).digest()).digest()
 
 
@@ -286,6 +286,50 @@ class SidechainRPC:
 
 
 # ----------------------------
+# Pool stats (shares, hashrate)
+# ----------------------------
+
+class PoolStats:
+    """Track basic share stats and estimate hashrate based on pool difficulty."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.total_shares = 0
+        self.accepted_shares = 0
+        self.start_time = time.time()
+
+    def record_share(self, accepted: bool):
+        with self.lock:
+            self.total_shares += 1
+            if accepted:
+                self.accepted_shares += 1
+
+    def snapshot(self):
+        with self.lock:
+            elapsed = time.time() - self.start_time
+            total = self.total_shares
+            accepted = self.accepted_shares
+
+        if elapsed <= 0 or accepted == 0:
+            return {
+                "elapsed": elapsed,
+                "total_shares": total,
+                "accepted_shares": accepted,
+                "hashrate_hs": None,
+            }
+
+        # Approximate hashrate: accepted_shares * (2^32 * difficulty) / elapsed
+        hashes = accepted * (2 ** 32) * POOL_DIFFICULTY
+        hps = hashes / elapsed
+        return {
+            "elapsed": elapsed,
+            "total_shares": total,
+            "accepted_shares": accepted,
+            "hashrate_hs": hps,
+        }
+
+
+# ----------------------------
 # Template builder (Drivechain hooks)
 # ----------------------------
 
@@ -299,7 +343,7 @@ class TemplateBuilder:
 
         self.current_job_id = 0
         self.current_template = None
-        self.extranonce1 = "00000001"   # fixed extranonce1 for simple setups
+        self.extranonce1 = "00000001"   # 4-byte extranonce1 (8 hex chars)
         self.extranonce2_size = 4       # bytes
 
         # job_id -> job data
@@ -516,12 +560,13 @@ class TemplateBuilder:
 # ----------------------------
 
 class StratumConnection(threading.Thread):
-    def __init__(self, conn, addr, tmpl_builder: TemplateBuilder, rpc: JsonRPC):
+    def __init__(self, conn, addr, tmpl_builder: TemplateBuilder, rpc: JsonRPC, stats: PoolStats):
         super().__init__(daemon=True)
         self.conn = conn
         self.addr = addr
         self.tmpl_builder = tmpl_builder
         self.rpc = rpc
+        self.stats = stats
 
         self.alive = True
         self.subscribed = False
@@ -604,50 +649,71 @@ class StratumConnection(threading.Thread):
         self.send_json(msg)
 
     def handle_submit(self, msg):
-        """Handle mining.submit: [worker_name, job_id, extranonce2, ntime, nonce]."""
+        """Handle mining.submit: [worker_name, job_id, extranonce2, ntime, nonce].
+
+        NOTE: We do NOT check SHA256d(header) against nBits here, because
+        Litecoin PoW is scrypt(header) and the full node will validate that.
+        This function treats every well-formed share as 'accepted' and
+        always calls submitblock; the node decides if it's a real block.
+        """
         params = msg.get("params", [])
         if len(params) != 5:
+            self.stats.record_share(accepted=False)
             resp = {"id": msg["id"], "result": None, "error": "Invalid params"}
             self.send_json(resp)
             return
 
-        _worker, job_id, extranonce2, ntime, nonce = params
+        worker, job_id, extranonce2, ntime, nonce = params
 
         try:
             block = self.tmpl_builder.build_full_block(job_id, extranonce2, ntime, nonce)
-            block_hash = sha256d(block[:80])[::-1].hex()
-            logging.info(f"Share from {self.addr}: job={job_id} hash={block_hash}")
+            header = block[:80]
 
-            # Look up job & compute network (full) target
-            job = self.tmpl_builder.jobs[job_id]
-            network_target = nbits_to_target(job["nbits"])
-            hash_int = int(block_hash, 16)
+            # Log a SHA256d hash for debugging/visibility only
+            header_hash_log = sha256d(header)[::-1].hex()
+            logging.info(
+                f"Share from {self.addr}: job={job_id} "
+                f"worker={worker} header_sha256d={header_hash_log}"
+            )
 
-            if hash_int > network_target:
-                # Regular share (above network target but valid) – accept it.
-                logging.info("Accepted share (above network target, regular share)")
-                resp = {"id": msg["id"], "result": True, "error": None}
-                self.send_json(resp)
-                return
-
-            # Hash <= network target: this is a block candidate!
-            logging.info("Share meets network target – submitting block to node")
+            # Always try submitting; Litecoin node will perform actual scrypt PoW check
             block_hex = block.hex()
             try:
                 submit_result = self.rpc.submitblock(block_hex)
                 if submit_result is None:
-                    logging.info("Block accepted by Litecoin node")
+                    logging.info("submitblock: block accepted (or already known) by Litecoin node")
                 else:
                     logging.warning(f"submitblock returned error: {submit_result}")
             except Exception:
                 logging.exception("submitblock RPC raised an exception")
 
-            # Either way, count it as an accepted share for the miner
+            # For this minimal/experimental server, we treat every valid share as accepted
+            self.stats.record_share(accepted=True)
+            snap = self.stats.snapshot()
+            if snap["hashrate_hs"] is not None:
+                mhps = snap["hashrate_hs"] / 1e6
+                logging.info(
+                    "Pool stats: accepted=%d total=%d elapsed=%.1fs "
+                    "approx_hashrate=%.2f MH/s",
+                    snap["accepted_shares"],
+                    snap["total_shares"],
+                    snap["elapsed"],
+                    mhps,
+                )
+            else:
+                logging.info(
+                    "Pool stats: accepted=%d total=%d elapsed=%.1fs (hashrate n/a yet)",
+                    snap["accepted_shares"],
+                    snap["total_shares"],
+                    snap["elapsed"],
+                )
+
             resp = {"id": msg["id"], "result": True, "error": None}
             self.send_json(resp)
 
         except Exception as e:
             logging.exception("Error handling share")
+            self.stats.record_share(accepted=False)
             resp = {"id": msg["id"], "result": None, "error": str(e)}
             self.send_json(resp)
 
@@ -701,8 +767,14 @@ class StratumConnection(threading.Thread):
             self.handle_authorize(msg)
         elif method == "mining.submit":
             self.handle_submit(msg)
+        elif method == "mining.configure":
+            # Antminers often send mining.configure; we just say
+            # "no special extensions supported" and move on.
+            if msg.get("id") is not None:
+                resp = {"id": msg["id"], "result": False, "error": None}
+                self.send_json(resp)
         else:
-        # Respond with null for unknown methods
+            # Respond with null for unknown methods
             if msg.get("id") is not None:
                 resp = {"id": msg.get("id"), "result": None, "error": f"Unknown method {method}"}
                 self.send_json(resp)
@@ -718,6 +790,7 @@ class StratumServer:
         self.port = port
         self.rpc = rpc
         self.tmpl_builder = TemplateBuilder(rpc, sidechain_rpc, enable_sidechain)
+        self.stats = PoolStats()
 
     def start(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -729,7 +802,7 @@ class StratumServer:
         try:
             while True:
                 conn, addr = s.accept()
-                handler = StratumConnection(conn, addr, self.tmpl_builder, self.rpc)
+                handler = StratumConnection(conn, addr, self.tmpl_builder, self.rpc, self.stats)
                 handler.start()
         finally:
             s.close()
@@ -742,7 +815,7 @@ class StratumServer:
 def main():
     rpc = JsonRPC(RPC_HOST, RPC_PORT, RPC_USER, RPC_PASSWORD)
 
-    sidechain_rpc = None
+    sidechain_rpc = None    # type: ignore
     if ENABLE_SIDECHAIN:
         logging.info("Sidechain support ENABLED (ENABLE_SIDECHAIN=1)")
         sc_rpc = JsonRPC(SC_RPC_HOST, SC_RPC_PORT, SC_RPC_USER, SC_RPC_PASSWORD)

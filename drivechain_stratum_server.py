@@ -22,6 +22,8 @@ from base64 import b64encode
 from http.client import HTTPConnection
 import os
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
 # ----------------------------
 # Simple .env loader (no python-dotenv dependency)
 # ----------------------------
@@ -57,15 +59,34 @@ def load_simple_env(path: str = ".env") -> None:
 load_simple_env()
 
 # ----------------------------
+# Network selection (mainnet / testnet / regtest) for Litecoin
+# ----------------------------
+
+NETWORK = os.getenv("NETWORK", "regtest").lower()
+if NETWORK not in ("mainnet", "testnet", "regtest"):
+    logging.warning(f"Unknown NETWORK '{NETWORK}', defaulting to regtest")
+    NETWORK = "regtest"
+
+# Litecoin default RPC ports per network
+if NETWORK == "mainnet":
+    _DEFAULT_RPC_PORT = "9332"
+elif NETWORK == "testnet":
+    _DEFAULT_RPC_PORT = "19332"
+else:  # regtest
+    _DEFAULT_RPC_PORT = "19443"
+
+# ----------------------------
 # Config (from environment / .env)
 # ----------------------------
 
 # Mainchain RPC (Litecoin with BIP301 / Drivechain patch)
 RPC_HOST = os.getenv("RPC_HOST", "127.0.0.1")
-# Default to Litecoin mainnet RPC port; override in .env if needed
-RPC_PORT = int(os.getenv("RPC_PORT", "9332"))
+# If RPC_PORT is not set, use the default for the chosen NETWORK
+RPC_PORT = int(os.getenv("RPC_PORT", _DEFAULT_RPC_PORT))
 RPC_USER = os.getenv("RPC_USER", "rpcuser")
 RPC_PASSWORD = os.getenv("RPC_PASSWORD", "rpcpassword")
+
+logging.info(f"Configured Litecoin NETWORK={NETWORK}, RPC at {RPC_HOST}:{RPC_PORT}")
 
 # Sidechain RPC (Thunder / cusf_sidechain / etc.)
 SC_RPC_HOST = os.getenv("SC_RPC_HOST", "127.0.0.1")
@@ -95,8 +116,6 @@ SIDECHAIN_NUMBER = int(os.getenv("SIDECHAIN_NUMBER", "0"))  # set this to your s
 # Example from `getaddressinfo "addr"` -> "pubkeyhash"
 # For Litecoin, this is still a 20-byte hash; address version bytes differ at the node/wallet level.
 MINER_PKH_HEX = os.getenv("MINER_PKH_HEX", "")
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
 # ----------------------------
@@ -683,7 +702,7 @@ class StratumConnection(threading.Thread):
         elif method == "mining.submit":
             self.handle_submit(msg)
         else:
-            # Respond with null for unknown methods
+        # Respond with null for unknown methods
             if msg.get("id") is not None:
                 resp = {"id": msg.get("id"), "result": None, "error": f"Unknown method {method}"}
                 self.send_json(resp)
